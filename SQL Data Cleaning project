@@ -1,0 +1,247 @@
+-- Credit Card Fraud Data Cleaning and Preparation for Power BI
+-- Microsoft SQL Server Compatible
+
+-- Step 1: Create a cleaned and enhanced view of the fraud data
+WITH CleanedTransactions AS (
+    SELECT 
+        -- Basic transaction information
+        TransactionID,
+        TransactionDate,
+        Amount,
+        MerchantID,
+        TransactionType,
+        Location,
+        IsFraud,
+        
+        -- Data quality flags
+        CASE WHEN TransactionID IS NULL THEN 1 ELSE 0 END as MissingTransactionID,
+        CASE WHEN Amount IS NULL OR Amount < 0 THEN 1 ELSE 0 END as InvalidAmount,
+        CASE WHEN TransactionDate IS NULL THEN 1 ELSE 0 END as MissingDate,
+        CASE WHEN Location IS NULL OR LTRIM(RTRIM(Location)) = '' THEN 1 ELSE 0 END as MissingLocation,
+        
+        -- Clean and standardize text fields
+        UPPER(LTRIM(RTRIM(ISNULL(TransactionType, 'UNKNOWN')))) as CleanTransactionType,
+        UPPER(LTRIM(RTRIM(ISNULL(Location, 'UNKNOWN')))) as CleanLocation,
+        
+        -- Extract date components for analysis
+        YEAR(TransactionDate) as TransactionYear,
+        MONTH(TransactionDate) as TransactionMonth,
+        DAY(TransactionDate) as TransactionDay,
+        DATEPART(WEEKDAY, TransactionDate) as DayOfWeek,
+        DATEPART(HOUR, TransactionDate) as TransactionHour,
+        
+        -- Create time categories
+        CASE 
+            WHEN DATEPART(HOUR, TransactionDate) BETWEEN 6 AND 11 THEN 'Morning'
+            WHEN DATEPART(HOUR, TransactionDate) BETWEEN 12 AND 17 THEN 'Afternoon'
+            WHEN DATEPART(HOUR, TransactionDate) BETWEEN 18 AND 21 THEN 'Evening'
+            ELSE 'Night'
+        END as TimeOfDay,
+        
+        -- Categorize amounts
+        CASE 
+            WHEN Amount < 100 THEN 'Small (< $100)'
+            WHEN Amount BETWEEN 100 AND 500 THEN 'Medium ($100-$500)'
+            WHEN Amount BETWEEN 501 AND 1500 THEN 'Large ($501-$1500)'
+            WHEN Amount > 1500 THEN 'Very Large (> $1500)'
+            ELSE 'Unknown'
+        END as AmountCategory,
+        
+        -- Round amounts for easier grouping
+        ROUND(Amount, 2) as RoundedAmount,
+        
+        -- Create fraud labels for better readability
+        CASE 
+            WHEN IsFraud = 1 THEN 'Fraudulent'
+            WHEN IsFraud = 0 THEN 'Legitimate'
+            ELSE 'Unknown'
+        END as FraudLabel
+        
+    FROM [Credit Card Fraud]  -- Replace with your actual table name
+    WHERE TransactionID IS NOT NULL  -- Remove completely invalid records
+),
+
+-- Step 2: Add statistical measures and rankings
+EnhancedTransactions AS (
+    SELECT 
+        *,
+        -- Statistical measures
+        AVG(Amount) OVER() as OverallAvgAmount,
+        STDEV(Amount) OVER() as OverallStdAmount,
+        
+        -- Amount percentiles
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Amount) OVER() as Q1_Amount,
+        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY Amount) OVER() as Median_Amount,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Amount) OVER() as Q3_Amount,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Amount) OVER() as P95_Amount,
+        
+        -- Location-based statistics
+        AVG(Amount) OVER(PARTITION BY CleanLocation) as LocationAvgAmount,
+        COUNT(*) OVER(PARTITION BY CleanLocation) as LocationTransactionCount,
+        SUM(CAST(IsFraud as INT)) OVER(PARTITION BY CleanLocation) as LocationFraudCount,
+        
+        -- Merchant-based statistics  
+        AVG(Amount) OVER(PARTITION BY MerchantID) as MerchantAvgAmount,
+        COUNT(*) OVER(PARTITION BY MerchantID) as MerchantTransactionCount,
+        SUM(CAST(IsFraud as INT)) OVER(PARTITION BY MerchantID) as MerchantFraudCount,
+        
+        -- Time-based patterns
+        COUNT(*) OVER(PARTITION BY TransactionHour) as HourlyTransactionCount,
+        SUM(CAST(IsFraud as INT)) OVER(PARTITION BY TransactionHour) as HourlyFraudCount,
+        
+        -- Ranking transactions by amount within each location
+        ROW_NUMBER() OVER(PARTITION BY CleanLocation ORDER BY Amount DESC) as LocationAmountRank,
+        
+        -- Flag outliers (amounts beyond 2 standard deviations)
+        CASE 
+            WHEN Amount > (AVG(Amount) OVER() + 2 * STDEV(Amount) OVER()) THEN 1
+            WHEN Amount < (AVG(Amount) OVER() - 2 * STDEV(Amount) OVER()) THEN 1
+            ELSE 0
+        END as IsAmountOutlier
+        
+    FROM CleanedTransactions
+    WHERE MissingTransactionID = 0
+      AND InvalidAmount = 0
+      AND MissingDate = 0
+),
+
+-- Step 3: Calculate fraud rates and risk scores
+FinalDataset AS (
+    SELECT 
+        -- Core transaction data
+        TransactionID,
+        TransactionDate,
+        RoundedAmount as Amount,
+        MerchantID,
+        CleanTransactionType as TransactionType,
+        CleanLocation as Location,
+        IsFraud,
+        FraudLabel,
+        
+        -- Date/Time fields
+        TransactionYear,
+        TransactionMonth,
+        TransactionDay,
+        DayOfWeek,
+        TransactionHour,
+        TimeOfDay,
+        AmountCategory,
+        
+        -- Statistical fields
+        OverallAvgAmount,
+        Q1_Amount,
+        Median_Amount,
+        Q3_Amount,
+        P95_Amount,
+        IsAmountOutlier,
+        
+        -- Location analysis
+        LocationTransactionCount,
+        LocationFraudCount,
+        CASE 
+            WHEN LocationTransactionCount > 0 
+            THEN CAST(LocationFraudCount as FLOAT) / LocationTransactionCount * 100
+            ELSE 0 
+        END as LocationFraudRate,
+        
+        -- Merchant analysis
+        MerchantTransactionCount,
+        MerchantFraudCount,
+        CASE 
+            WHEN MerchantTransactionCount > 0 
+            THEN CAST(MerchantFraudCount as FLOAT) / MerchantTransactionCount * 100
+            ELSE 0 
+        END as MerchantFraudRate,
+        
+        -- Time-based analysis
+        HourlyTransactionCount,
+        HourlyFraudCount,
+        CASE 
+            WHEN HourlyTransactionCount > 0 
+            THEN CAST(HourlyFraudCount as FLOAT) / HourlyTransactionCount * 100
+            ELSE 0 
+        END as HourlyFraudRate,
+        
+        -- Risk indicators
+        CASE WHEN RoundedAmount = ROUND(RoundedAmount, 0) AND RoundedAmount >= 100 THEN 1 ELSE 0 END as IsRoundAmount,
+        CASE WHEN CleanTransactionType = 'REFUND' THEN 1 ELSE 0 END as IsRefund,
+        CASE WHEN DATEPART(HOUR, TransactionDate) >= 23 OR DATEPART(HOUR, TransactionDate) < 6 THEN 1 ELSE 0 END as IsNightTransaction,
+        
+        -- Data quality indicators
+        CASE 
+            WHEN LocationTransactionCount >= 10 THEN 'High Volume Location'
+            WHEN LocationTransactionCount >= 5 THEN 'Medium Volume Location'
+            ELSE 'Low Volume Location'
+        END as LocationVolumeCategory,
+        
+        -- Simple risk score for Power BI
+        (CASE WHEN IsAmountOutlier = 1 THEN 2 ELSE 0 END +
+         CASE WHEN RoundedAmount = ROUND(RoundedAmount, 0) AND RoundedAmount >= 100 THEN 1 ELSE 0 END +
+         CASE WHEN CleanTransactionType = 'REFUND' THEN 1 ELSE 0 END +
+         CASE WHEN DATEPART(HOUR, TransactionDate) >= 23 OR DATEPART(HOUR, TransactionDate) < 6 THEN 1 ELSE 0 END) as RiskScore
+    FROM EnhancedTransactions
+)
+
+-- Final SELECT: Clean dataset ready for Power BI
+SELECT 
+    TransactionID,
+    TransactionDate,
+    Amount,
+    MerchantID,
+    TransactionType,
+    Location,
+    IsFraud,
+    FraudLabel,
+    
+    -- Time dimensions
+    TransactionYear,
+    TransactionMonth,
+    TransactionDay,
+    CASE 
+        WHEN DayOfWeek = 1 THEN 'Sunday'
+        WHEN DayOfWeek = 2 THEN 'Monday'
+        WHEN DayOfWeek = 3 THEN 'Tuesday'
+        WHEN DayOfWeek = 4 THEN 'Wednesday'
+        WHEN DayOfWeek = 5 THEN 'Thursday'
+        WHEN DayOfWeek = 6 THEN 'Friday'
+        WHEN DayOfWeek = 7 THEN 'Saturday'
+    END as DayOfWeekName,
+    TransactionHour,
+    TimeOfDay,
+    
+    -- Amount analysis
+    AmountCategory,
+    IsAmountOutlier,
+    OverallAvgAmount,
+    Median_Amount,
+    
+    -- Location insights
+    LocationTransactionCount,
+    LocationFraudCount,
+    ROUND(LocationFraudRate, 2) as LocationFraudRate,
+    LocationVolumeCategory,
+    
+    -- Merchant insights  
+    MerchantTransactionCount,
+    MerchantFraudCount,
+    ROUND(MerchantFraudRate, 2) as MerchantFraudRate,
+    
+    -- Time-based insights
+    HourlyTransactionCount,
+    HourlyFraudCount,
+    ROUND(HourlyFraudRate, 2) as HourlyFraudRate,
+    
+    -- Risk factors
+    IsRoundAmount,
+    IsRefund,
+    IsNightTransaction,
+    RiskScore,
+    CASE 
+        WHEN RiskScore >= 3 THEN 'High Risk'
+        WHEN RiskScore >= 2 THEN 'Medium Risk'
+        WHEN RiskScore >= 1 THEN 'Low Risk'
+        ELSE 'Very Low Risk'
+    END as RiskCategory
+
+FROM FinalDataset
+ORDER BY TransactionDate DESC;
