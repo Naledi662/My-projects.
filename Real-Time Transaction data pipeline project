@@ -1,0 +1,364 @@
+# Real-time Transaction Data Streaming Pipeline
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, asdict
+from enum import Enum
+import aiohttp
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+import asyncpg
+import redis.asyncio as aioredis
+from pydantic import BaseModel, ValidationError
+import signal
+from concurrent.futures import ThreadPoolExecutor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# === Data Models ===
+class TransactionType(str, Enum):
+    PAYMENT = "payment"
+    REFUND = "refund"
+    TRANSFER = "transfer"
+    DEPOSIT = "deposit"
+    WITHDRAWAL = "withdrawal"
+
+class TransactionStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class Transaction(BaseModel):
+    transaction_id: str
+    user_id: str
+    amount: float
+    currency: str
+    transaction_type: TransactionType
+    status: TransactionStatus
+    timestamp: datetime
+    metadata: Optional[Dict[str, Any]] = None
+
+    class Config:
+        use_enum_values = True
+
+@dataclass
+class PipelineConfig:
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_topic: str = "transactions"
+    kafka_consumer_group: str = "transaction_processor"
+    postgres_url: str = "postgresql://user:password@localhost:5432/transactions"
+    redis_url: str = "redis://localhost:6379"
+    api_endpoints: List[str] = None
+    api_poll_interval: int = 30
+    batch_size: int = 100
+    max_workers: int = 4
+
+    def __post_init__(self):
+        if self.api_endpoints is None:
+            self.api_endpoints = [
+                "https://api.example.com/transactions",
+                "https://api.partner.com/payments"
+            ]
+
+# === Data Sources ===
+class DataSource:
+    async def start(self):
+        raise NotImplementedError
+    async def stop(self):
+        raise NotImplementedError
+
+class KafkaSource(DataSource):
+    def __init__(self, config: PipelineConfig, processor_callback):
+        self.config = config
+        self.processor_callback = processor_callback
+        self.consumer = None
+        self.running = False
+
+    async def start(self):
+        self.consumer = AIOKafkaConsumer(
+            self.config.kafka_topic,
+            bootstrap_servers=self.config.kafka_bootstrap_servers,
+            group_id=self.config.kafka_consumer_group,
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+            auto_offset_reset="latest"
+        )
+        await self.consumer.start()
+        self.running = True
+        logger.info(f"Kafka consumer started for topic: {self.config.kafka_topic}")
+
+        try:
+            async for message in self.consumer:
+                if not self.running:
+                    break
+                try:
+                    transaction = Transaction(**message.value)
+                    await self.processor_callback(transaction)
+                except ValidationError as e:
+                    logger.error(f"Invalid Kafka transaction: {e}")
+        except Exception as e:
+            logger.error(f"Kafka consumer error: {e}")
+        finally:
+            await self.consumer.stop()
+
+    async def stop(self):
+        self.running = False
+        if self.consumer:
+            await self.consumer.stop()
+        logger.info("Kafka consumer stopped")
+
+class APISource(DataSource):
+    def __init__(self, config: PipelineConfig, processor_callback):
+        self.config = config
+        self.processor_callback = processor_callback
+        self.session = None
+        self.running = False
+
+    async def start(self):
+        self.session = aiohttp.ClientSession()
+        self.running = True
+        logger.info(f"API polling started for {len(self.config.api_endpoints)} endpoints")
+        tasks = [asyncio.create_task(self._poll_endpoint(ep)) for ep in self.config.api_endpoints]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await self.session.close()
+
+    async def _poll_endpoint(self, endpoint: str):
+        while self.running:
+            try:
+                async with self.session.get(endpoint) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for tx_data in data.get("transactions", []):
+                            try:
+                                transaction = Transaction(**tx_data)
+                                await self.processor_callback(transaction)
+                            except ValidationError as e:
+                                logger.error(f"Invalid API transaction: {e}")
+                    else:
+                        logger.warning(f"API {endpoint} returned {resp.status}")
+            except Exception as e:
+                logger.error(f"Error polling API {endpoint}: {e}")
+            await asyncio.sleep(self.config.api_poll_interval)
+
+    async def stop(self):
+        self.running = False
+        if self.session:
+            await self.session.close()
+        logger.info("API polling stopped")
+
+# === Data Processor ===
+class DataProcessor:
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.postgres_pool = None
+        self.redis_client = None
+        self.kafka_producer = None
+        self.executor = ThreadPoolExecutor(max_workers=config.max_workers)
+        self.batch_buffer: List[Transaction] = []
+        self.last_batch_time = datetime.now(timezone.utc)
+
+    async def initialize(self):
+        self.postgres_pool = await asyncpg.create_pool(
+            self.config.postgres_url, min_size=2, max_size=10
+        )
+        self.redis_client = aioredis.from_url(self.config.redis_url)
+        self.kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=self.config.kafka_bootstrap_servers,
+            value_serializer=lambda x: json.dumps(x, default=str).encode("utf-8")
+        )
+        await self.kafka_producer.start()
+        await self._create_tables()
+        logger.info("DataProcessor initialized successfully")
+
+    async def _create_tables(self):
+        sql = """
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id VARCHAR(255) PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            amount DECIMAL(15,2) NOT NULL,
+            currency VARCHAR(10) NOT NULL,
+            transaction_type VARCHAR(50) NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            timestamp TIMESTAMPTZ NOT NULL,
+            metadata JSONB,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(transaction_type);
+        """
+        async with self.postgres_pool.acquire() as conn:
+            await conn.execute(sql)
+        logger.info("Database tables verified/created")
+
+    async def process_transaction(self, transaction: Transaction):
+        self.batch_buffer.append(transaction)
+        now = datetime.now(timezone.utc)
+        time_diff = (now - self.last_batch_time).total_seconds()
+        if len(self.batch_buffer) >= self.config.batch_size or time_diff >= 10:
+            await self._process_batch()
+
+    async def _process_batch(self):
+        if not self.batch_buffer:
+            return
+        batch = self.batch_buffer.copy()
+        self.batch_buffer.clear()
+        self.last_batch_time = datetime.now(timezone.utc)
+        await asyncio.gather(
+            self._store_batch_postgres(batch),
+            self._cache_batch_redis(batch),
+            self._publish_batch_kafka(batch),
+            self._update_metrics(batch)
+        )
+        logger.info(f"Processed batch of {len(batch)} transactions")
+
+    async def _store_batch_postgres(self, batch: List[Transaction]):
+        sql = """
+        INSERT INTO transactions
+        (transaction_id, user_id, amount, currency, transaction_type, status, timestamp, metadata)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (transaction_id) DO UPDATE SET
+            status=EXCLUDED.status,
+            metadata=EXCLUDED.metadata
+        """
+        async with self.postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                for tx in batch:
+                    await conn.execute(
+                        sql, tx.transaction_id, tx.user_id, tx.amount,
+                        tx.currency, tx.transaction_type.value, tx.status.value,
+                        tx.timestamp, json.dumps(tx.metadata) if tx.metadata else None
+                    )
+
+    async def _cache_batch_redis(self, batch: List[Transaction]):
+        pipe = self.redis_client.pipeline(transaction=True)
+        for tx in batch:
+            key = f"transaction:{tx.transaction_id}"
+            pipe.setex(key, 3600, json.dumps(asdict(tx), default=str))
+            user_key = f"user_transactions:{tx.user_id}"
+            pipe.lpush(user_key, tx.transaction_id)
+            pipe.ltrim(user_key, 0, 99)
+            pipe.expire(user_key, 86400)
+        await pipe.execute()
+
+    async def _publish_batch_kafka(self, batch: List[Transaction]):
+        for tx in batch:
+            await self.kafka_producer.send_and_wait("processed_transactions", asdict(tx))
+
+    async def _update_metrics(self, batch: List[Transaction]):
+        pipe = self.redis_client.pipeline(transaction=True)
+        current_hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        for tx in batch:
+            pipe.incr(f"metrics:type:{tx.transaction_type.value}:{current_hour}")
+            pipe.incr(f"metrics:status:{tx.status.value}:{current_hour}")
+            pipe.incr(f"metrics:total:{current_hour}")
+            pipe.expire(f"metrics:type:{tx.transaction_type.value}:{current_hour}", 604800)
+            pipe.expire(f"metrics:status:{tx.status.value}:{current_hour}", 604800)
+            pipe.expire(f"metrics:total:{current_hour}", 604800)
+        await pipe.execute()
+
+    async def cleanup(self):
+        if self.batch_buffer:
+            await self._process_batch()
+        if self.kafka_producer:
+            await self.kafka_producer.stop()
+        if self.postgres_pool:
+            await self.postgres_pool.close()
+        if self.redis_client:
+            await self.redis_client.close()
+        self.executor.shutdown(wait=True)
+        logger.info("DataProcessor cleaned up")
+
+# === Streaming Pipeline ===
+class StreamingPipeline:
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.processor = DataProcessor(config)
+        self.sources: List[DataSource] = []
+        self.running = False
+
+    async def initialize(self):
+        await self.processor.initialize()
+        self.sources = [
+            KafkaSource(self.config, self.processor.process_transaction),
+            APISource(self.config, self.processor.process_transaction)
+        ]
+        logger.info("StreamingPipeline initialized")
+
+    async def start(self):
+        self.running = True
+        logger.info("Starting StreamingPipeline...")
+        try:
+            await asyncio.gather(*(source.start() for source in self.sources))
+        except Exception as e:
+            logger.error(f"Pipeline error: {e}")
+        finally:
+            await self.stop()
+
+    async def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        for source in self.sources:
+            await source.stop()
+        await self.processor.cleanup()
+        logger.info("StreamingPipeline stopped")
+
+# === Health Checker ===
+class HealthChecker:
+    def __init__(self, processor: DataProcessor):
+        self.processor = processor
+
+    async def get_health_status(self) -> Dict[str, Any]:
+        try:
+            async with self.processor.postgres_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            db_status = "healthy"
+        except Exception as e:
+            db_status = f"unhealthy: {e}"
+
+        try:
+            await self.processor.redis_client.ping()
+            redis_status = "healthy"
+        except Exception as e:
+            redis_status = f"unhealthy: {e}"
+
+        current_hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        total_processed = await self.processor.redis_client.get(f"metrics:total:{current_hour}")
+        return {
+            "status": "healthy" if db_status=="healthy" and redis_status=="healthy" else "unhealthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database": db_status,
+            "redis": redis_status,
+            "processed_this_hour": int(total_processed) if total_processed else 0,
+            "batch_buffer_size": len(self.processor.batch_buffer)
+        }
+
+# === Main ===
+async def main():
+    config = PipelineConfig(batch_size=50, max_workers=4)
+    pipeline = StreamingPipeline(config)
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(pipeline.stop()))
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(pipeline.stop()))
+
+    try:
+        await pipeline.initialize()
+        await pipeline.start()
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        await pipeline.stop()
+    finally:
+        logger.info("Pipeline shutdown complete")
+
+if __name__ == "__main__":
+    asyncio.run(main())
